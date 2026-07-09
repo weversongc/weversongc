@@ -436,7 +436,7 @@ elif opcao.startswith("📊"):
         if st.button("🔄 Executar Conciliação", use_container_width=True):
             with st.spinner("Cruzando dados..."):
                 try:
-                    df_plan = pd.read_excel(arq_braslog, sheet_name="3", header=5)
+                    df_plan = pd.read_excel(arq_braslog, sheet_name="MOVIMENTO", header=5)
                     df_plan.columns = [str(c).strip() for c in df_plan.columns]
                     df_plan = df_plan[df_plan["CONTA"] == "SIC"].copy()
                     df_plan["DATA"] = pd.to_datetime(df_plan["DATA"], errors="coerce").dt.normalize()
@@ -514,7 +514,7 @@ elif opcao.startswith("💸"):
         if st.button("🔍 Analisar Diferenças", use_container_width=True):
             with st.spinner("Filtrando e calculando saldos..."):
                 try:
-                    df = pd.read_excel(arq_diferenca, sheet_name="3", header=5)
+                    df = pd.read_excel(arq_diferenca, sheet_name="MOVIMENTO", header=5)
                     df.columns = [str(c).strip() for c in df.columns]
                     col_obs = [c for c in df.columns if "OBS" in c.upper()][0]
                     df["DATA"] = pd.to_datetime(df["DATA"], errors="coerce").dt.normalize()
