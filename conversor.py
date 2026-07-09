@@ -124,10 +124,8 @@ class ConversorPDF:
     def _processar_pagina(self, page, sheet, linha_inicio: int, larguras: dict) -> bool:
         texto_real = page.extract_text() or ""
 
-        tem_estrutura = self._tem_estrutura_tabela_real(page)
-
-        # 1. Estrutura de tabela real -> estrategia 'lines'
-        if tem_estrutura:
+        # 1. Estrutura de tabela real (linhas desenhadas) -> estrategia 'lines'
+        if self._tem_estrutura_tabela_real(page):
             tabelas = self._extrair_tabelas_estrategia(page, "lines")
             validas = [t for t in tabelas
                        if t and self._qualidade_tabela_suficiente(t)
@@ -139,23 +137,71 @@ class ConversorPDF:
                     linha += 1  # linha em branco entre tabelas
                 return True
 
-        # 2. Indicio de tabela sem bordas -> estrategia 'text'
-        if tem_estrutura or self._indicio_tabela_sem_bordas(page, texto_real):
-            tabelas = self._extrair_tabelas_estrategia(page, "text")
-            validas = [t for t in tabelas
-                       if t and self._qualidade_tabela_suficiente(t)
-                       and self._parece_tabular(t)
-                       and not self._eh_prosa_fragmentada(t)]
-            if validas:
-                linha = linha_inicio
-                for t in validas:
-                    linha = self._escrever_tabela(sheet, t, linha, larguras)
-                    linha += 1
-                return True
+        # 2. Extracao por linhas de palavras (NAO parte palavras ao meio).
+        #    Agrupa palavras proximas na mesma celula e so separa colunas
+        #    onde existe um espaco horizontal grande de verdade.
+        rows = self._extrair_linhas_palavras(page)
+        if rows:
+            self._escrever_tabela(sheet, rows, linha_inicio, larguras)
+            return True
 
-        # 3. Texto livre
+        # 3. Texto livre (ultima alternativa)
         self._escrever_texto(sheet, texto_real, linha_inicio)
         return False
+
+    def _extrair_linhas_palavras(self, page):
+        """
+        Extrai o conteudo da pagina como linhas de celulas, agrupando
+        palavras pela posicao vertical e separando colunas apenas quando
+        o espaco horizontal entre palavras e grande.
+        Nunca corta uma palavra ao meio.
+        """
+        try:
+            words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
+        except Exception:
+            return []
+        if not words:
+            return []
+
+        # Agrupa palavras em linhas pela coordenada vertical (top)
+        words.sort(key=lambda w: (round(w["top"] / 3), w["x0"]))
+        linhas = []
+        atual = []
+        topo_atual = None
+        for w in words:
+            if topo_atual is None or abs(w["top"] - topo_atual) <= 4:
+                atual.append(w)
+                if topo_atual is None:
+                    topo_atual = w["top"]
+            else:
+                linhas.append(atual)
+                atual = [w]
+                topo_atual = w["top"]
+        if atual:
+            linhas.append(atual)
+
+        rows = []
+        for linha in linhas:
+            linha.sort(key=lambda w: w["x0"])
+            # largura media de caractere nesta linha (para calibrar o limiar)
+            chars = sum(len(w["text"]) for w in linha)
+            largura_total = sum(max(0, w["x1"] - w["x0"]) for w in linha)
+            char_w = (largura_total / chars) if chars else 4.0
+            limiar = max(10.0, char_w * 4.0)
+
+            celulas = []
+            cel = [linha[0]]
+            for prev, w in zip(linha, linha[1:]):
+                gap = w["x0"] - prev["x1"]
+                if gap >= limiar:  # espaco grande -> nova coluna
+                    celulas.append(" ".join(c["text"] for c in cel))
+                    cel = [w]
+                else:
+                    cel.append(w)
+            celulas.append(" ".join(c["text"] for c in cel))
+            rows.append(celulas)
+        return rows
+
 
     def _tem_estrutura_tabela_real(self, page) -> bool:
         try:
