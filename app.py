@@ -1,9 +1,8 @@
 import streamlit as st
 import pandas as pd
-import pdfplumber
 import io
 from supabase import create_client, Client
-from openpyxl import Workbook
+from conversor import ConversorPDF
 
 # =========================================================================
 # 1. CONFIGURAÇÃO DE PÁGINA
@@ -397,33 +396,26 @@ if opcao.startswith("📄"):
 
     if arquivo_pdf is not None:
         st.markdown("###")
+        senha = st.text_input("Senha do PDF (se protegido)", type="password", placeholder="Deixe em branco se não tiver senha")
         if st.button("🚀 Iniciar Conversão", use_container_width=True):
-            with st.spinner("Processando páginas do PDF..."):
-                wb = Workbook()
-                if "Sheet" in wb.sheetnames:
-                    wb.remove(wb["Sheet"])
-                with pdfplumber.open(arquivo_pdf) as pdf:
-                    for i, pagina in enumerate(pdf.pages):
-                        ws = wb.create_sheet(title=f"Pagina_{i+1}")
-                        tabelas = pagina.extract_tables()
-                        if tabelas:
-                            for tabela in tabelas:
-                                for linha in tabela:
-                                    ws.append(linha)
-                        else:
-                            texto = pagina.extract_text()
-                            if texto:
-                                for linha in texto.split("\n"):
-                                    ws.append([linha])
-                output = io.BytesIO()
-                wb.save(output)
-                dados_excel = output.getvalue()
-                st.success("🎉 PDF convertido com sucesso!")
-                nome_final = arquivo_pdf.name.replace(".pdf", ".xlsx")
-                st.download_button("📥 Baixar Arquivo Excel", dados_excel, file_name=nome_final,
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                   use_container_width=True)
-                enviar_para_supabase(f"conversoes/{nome_final}", dados_excel)
+            with st.spinner("Processando páginas do PDF e montando uma única aba..."):
+                conv = ConversorPDF()
+                res = conv.converter_para_excel(arquivo_pdf, senha=senha or "")
+                if not res["ok"]:
+                    st.error(f"Erro na conversão: {res['erro']}")
+                else:
+                    dados_excel = res["dados"]
+                    st.success("🎉 PDF convertido com sucesso!")
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Páginas", res["paginas"])
+                    m2.metric("Como Tabela", res["tabelas"])
+                    m3.metric("Como Texto", res["paginas_texto"])
+                    st.caption("📄 Tudo consolidado em **uma única aba** preservando o layout do PDF.")
+                    nome_final = arquivo_pdf.name.replace(".pdf", ".xlsx")
+                    st.download_button("📥 Baixar Arquivo Excel", dados_excel, file_name=nome_final,
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                       use_container_width=True)
+                    enviar_para_supabase(f"conversoes/{nome_final}", dados_excel)
 
 # ---- CONCILIAÇÃO ----
 elif opcao.startswith("📊"):
