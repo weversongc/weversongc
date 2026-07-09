@@ -1,7 +1,9 @@
 import streamlit as st
 import pandas as pd
 import io
+import csv
 from supabase import create_client, Client
+from openpyxl import load_workbook
 from conversor import ConversorPDF
 
 # =========================================================================
@@ -370,13 +372,6 @@ if opcao.startswith("📄"):
 
     st.markdown('<div class="glass dropzone">', unsafe_allow_html=True)
     st.markdown('<div class="tag-rule">200MB per file • PDF</div>', unsafe_allow_html=True)
-    st.markdown("""
-        <div class="flow">
-            <div class="node pdf">📕<small>PDF</small></div>
-            <div class="arrow">• • ▸</div>
-            <div class="node xls">📗<small>XLSX</small></div>
-        </div>
-    """, unsafe_allow_html=True)
     arquivo_pdf = st.file_uploader("Arraste seu arquivo PDF aqui", type=["pdf"], label_visibility="collapsed")
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -396,7 +391,12 @@ if opcao.startswith("📄"):
 
     if arquivo_pdf is not None:
         st.markdown("###")
-        senha = st.text_input("Senha do PDF (se protegido)", type="password", placeholder="Deixe em branco se não tiver senha")
+        col_fmt, col_pwd = st.columns([1, 2])
+        with col_fmt:
+            formato = st.radio("Formato de saída", ["Excel (.xlsx)", "CSV (.csv)"], horizontal=True)
+        with col_pwd:
+            senha = st.text_input("Senha do PDF (se protegido)", type="password",
+                                  placeholder="Deixe em branco se não tiver senha")
         if st.button("🚀 Iniciar Conversão", use_container_width=True):
             with st.spinner("Processando páginas do PDF e montando uma única aba..."):
                 conv = ConversorPDF()
@@ -404,18 +404,32 @@ if opcao.startswith("📄"):
                 if not res["ok"]:
                     st.error(f"Erro na conversão: {res['erro']}")
                 else:
-                    dados_excel = res["dados"]
                     st.success("🎉 PDF convertido com sucesso!")
                     m1, m2, m3 = st.columns(3)
                     m1.metric("Páginas", res["paginas"])
                     m2.metric("Como Tabela", res["tabelas"])
                     m3.metric("Como Texto", res["paginas_texto"])
-                    st.caption("📄 Tudo consolidado em **uma única aba** preservando o layout do PDF.")
-                    nome_final = arquivo_pdf.name.replace(".pdf", ".xlsx")
-                    st.download_button("📥 Baixar Arquivo Excel", dados_excel, file_name=nome_final,
-                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                       use_container_width=True)
-                    enviar_para_supabase(f"conversoes/{nome_final}", dados_excel)
+
+                    if formato.startswith("CSV"):
+                        wb2 = load_workbook(io.BytesIO(res["dados"]))
+                        ws2 = wb2.active
+                        texto = io.StringIO()
+                        writer = csv.writer(texto, quoting=csv.QUOTE_ALL)
+                        for row in ws2.iter_rows(values_only=True):
+                            writer.writerow(["" if v is None else str(v) for v in row])
+                        dados_out = ("\ufeff" + texto.getvalue()).encode("utf-8")
+                        nome_final = arquivo_pdf.name.replace(".pdf", ".csv")
+                        mime = "text/csv"
+                        st.caption("📄 Tudo consolidado em **um único CSV** (separador vírgula, campos entre aspas).")
+                    else:
+                        dados_out = res["dados"]
+                        nome_final = arquivo_pdf.name.replace(".pdf", ".xlsx")
+                        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        st.caption("📄 Tudo consolidado em **uma única aba** preservando o layout do PDF.")
+
+                    st.download_button("📥 Baixar Arquivo", dados_out, file_name=nome_final,
+                                       mime=mime, use_container_width=True)
+                    enviar_para_supabase(f"conversoes/{nome_final}", dados_out)
 
 # ---- CONCILIAÇÃO ----
 elif opcao.startswith("📊"):

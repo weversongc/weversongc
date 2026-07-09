@@ -11,6 +11,7 @@ Adaptado do conversor_pdf.py de referencia, mas consolidado em so sheet.
 from __future__ import annotations
 
 import io
+import re
 import traceback
 from collections import Counter, defaultdict
 
@@ -22,8 +23,11 @@ from openpyxl.utils import get_column_letter
 HEADER_FILL = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
 HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
 TEXT_FONT = Font(size=10)
-WRAP_ALIGNMENT = Alignment(wrap_text=True, vertical="top")
+WRAP_ALIGNMENT = Alignment(wrap_text=False, vertical="top")
 PAGE_SEP_FONT = Font(bold=True, italic=True, color="9CA3AF", size=9)
+
+# Numero (pt-BR: pode ter ponto de milhar e virgula decimal) seguido de D/C
+_VALOR_DIR_RE = re.compile(r"^\s*([\d.,]+)\s*([DCdc])\s*$")
 
 
 class ConversorPDF:
@@ -245,6 +249,7 @@ class ConversorPDF:
     # Escrita
     # ------------------------------------------------------------------
     def _escrever_tabela(self, sheet, tabela, linha_inicio: int, larguras: dict) -> int:
+        tabela = self._dividir_valor_direcao(tabela)
         linha = linha_inicio
         for i, row in enumerate(tabela):
             for j, celula in enumerate(row, start=1):
@@ -274,6 +279,22 @@ class ConversorPDF:
     # ------------------------------------------------------------------
     # Utilitarios
     # ------------------------------------------------------------------
+    def _dividir_valor_direcao(self, tabela):
+        """Separa celulas do tipo '72,12D' em duas: '72,12' e 'D'."""
+        nova = []
+        for linha in tabela:
+            nova_linha = []
+            for celula in linha:
+                txt = self._limpar_celula(celula)
+                m = _VALOR_DIR_RE.match(txt)
+                if m:
+                    nova_linha.append(m.group(1))
+                    nova_linha.append(m.group(2).upper())
+                else:
+                    nova_linha.append(celula)
+            nova.append(nova_linha)
+        return nova
+
     @staticmethod
     def _limpar_celula(valor) -> str:
         if valor is None:
