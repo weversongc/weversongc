@@ -1,367 +1,342 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Conversor PDF -> XLSX (uma unica aba)
-=====================================
-Extrai o conteudo de um PDF preservando o maximo do layout original
-(tabelas reais viram tabelas; texto livre vira linhas) e escreve TUDO
-em uma unica aba do Excel, pagina apos pagina.
+Extrator de extrato Sicoob PDF -> CSV
+======================================
+Le um extrato de conta corrente do Sicoob em PDF e gera um arquivo CSV
+com as transacoes no formato:
 
-Adaptado do conversor_pdf.py de referencia, mas consolidado em so sheet.
+    DATA,TIPO,"VALOR",C/D,DESCRICAO
+
+Exemplo de linha:
+    01/06/2026,PIX REC.OUTRA IF MT,"20.171,17",C,Recebimento Pix BRASLOG T LTDA 53.983.231 0001-29 DOC.: Pix
+
+Uso:
+    python extract_sicoob_csv.py <arquivo.pdf> [saida.csv]
+
+Se [saida.csv] nao for informado, o CSV sera salvo com o mesmo nome do PDF,
+mas com extensao .csv, no mesmo diretorio.
 """
 
 from __future__ import annotations
 
-import io
+import csv
+import os
 import re
-import traceback
-from collections import Counter, defaultdict
+import sys
+from typing import List, Dict, Optional, Tuple
 
 import pdfplumber
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
-
-HEADER_FILL = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
-TEXT_FONT = Font(size=10)
-WRAP_ALIGNMENT = Alignment(wrap_text=False, vertical="top")
-PAGE_SEP_FONT = Font(bold=True, italic=True, color="9CA3AF", size=9)
-
-# Numero (pt-BR: pode ter ponto de milhar e virgula decimal) seguido de D/C
-_VALOR_DIR_RE = re.compile(r"^\s*([\d.,]+)\s*([DCdc])\s*$")
 
 
-class ConversorPDF:
-    MIN_TABLE_ROWS = 2
-    MIN_TABLE_COLS = 2
+# ---------------------------------------------------------------------------
+# Configuracao
+# ---------------------------------------------------------------------------
+SKIP_TYPES = {"SALDO ANTERIOR", "SALDO BLOQ.ANTERIOR", "SALDO DO DIA"}
 
-    def __init__(self, log_callback=None):
-        self.log = log_callback or (lambda msg, level="info": None)
+# Linhas de parada (fim do extrato)
+STOP_MARKERS = {"RESUMO", "SAC:", "OUVIDORIA", "ENCARGOS VENCIDOS"}
 
-    # ------------------------------------------------------------------
-    # API publica
-    # ------------------------------------------------------------------
-    def converter_para_excel(self, pdf_file, senha: str = "") -> dict:
-        """
-        Converte um PDF (caminho ou file-like) em bytes de um .xlsx
-        com UMA unica aba preservando o layout.
 
-        Retorna dict com ok, paginas, tabelas, paginas_texto, erro, dados(bytes).
-        """
-        resultado = {"ok": False, "paginas": 0, "tabelas": 0,
-                     "paginas_texto": 0, "erro": None, "dados": b""}
+# ---------------------------------------------------------------------------
+# Funcoes auxiliares
+# ---------------------------------------------------------------------------
+def extract_year(text: str) -> Optional[int]:
+    """Extrai o ano do cabecalho PERIODO ou da linha de data do extrato."""
+    # Tenta PERIODO: 01/05/2026 - 31/05/2026
+    m = re.search(r'PER[IÍ]ODO:\s*\d{2}/\d{2}/(\d{4})', text)
+    if m:
+        return int(m.group(1))
+    # Tenta data no cabecalho: 30/06/2026 EXTRATO ...
+    m = re.search(r'(\d{2}/\d{2}/(\d{4}))\s+EXTRATO', text)
+    if m:
+        return int(m.group(2))
+    return None
 
-        try:
-            with pdfplumber.open(pdf_file, password=senha or "") as pdf:
-                resultado["paginas"] = len(pdf.pages)
 
-                wb = Workbook()
-                default_sheet = wb.active
-                ws = wb.create_sheet(title="PDF")
+def is_transaction_start(line: str) -> bool:
+    """Verifica se a linha inicia uma transacao (comeca com DD/MM)."""
+    return bool(re.match(r'^\d{2}/\d{2}\s', line))
 
-                larguras = defaultdict(int)  # coluna -> largura maxima acumulada
-                linha_atual = 1
 
-                for idx, page in enumerate(pdf.pages, start=1):
-                    # Separador discreto entre paginas (exceto antes da primeira)
-                    if idx > 1:
-                        ws.cell(row=linha_atual, column=1,
-                                value=f"— Página {idx} —").font = PAGE_SEP_FONT
-                        ws.cell(row=linha_atual, column=1).alignment = WRAP_ALIGNMENT
-                        linha_atual += 2  # linha do marcador + linha em branco
-
-                    inicio_pagina = linha_atual
-                    eh_tabela = self._processar_pagina(page, ws, linha_inicio=linha_atual, larguras=larguras)
-                    if eh_tabela:
-                        resultado["tabelas"] += 1
-                    else:
-                        resultado["paginas_texto"] += 1
-
-                    # Descobre ate onde a escrita chegou
-                    linha_atual = ws.max_row + 2
-
-                    self.log(f"Página {idx}/{resultado['paginas']} processada.", level="info")
-
-                # Remove a aba padrao vazia
-                if default_sheet is not None and default_sheet.title in wb.sheetnames:
-                    wb.remove(default_sheet)
-                if not wb.sheetnames:
-                    wb.create_sheet(title="Vazio")
-
-                # Aplica larguras acumuladas (max por coluna)
-                for col_idx, w in larguras.items():
-                    ws.column_dimensions[get_column_letter(col_idx)].width = min(w + 2, 60)
-
-                # Congela a primeira linha
-                ws.freeze_panes = "A2"
-
-                buf = io.BytesIO()
-                wb.save(buf)
-                resultado["dados"] = buf.getvalue()
-                resultado["ok"] = True
-
-        except Exception as e:
-            nome_exc = type(e).__name__
-            msg_exc = str(e).lower()
-            causa = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
-            nome_causa = type(causa).__name__ if causa else ""
-            indicios_senha = (
-                "password" in nome_exc.lower() or "password" in msg_exc
-                or nome_exc == "PDFPasswordIncorrect"
-                or "password" in nome_causa.lower() or nome_causa == "PDFPasswordIncorrect"
-            )
-            if indicios_senha:
-                resultado["erro"] = "PDF protegido por senha (senha incorreta ou ausente)"
-            else:
-                resultado["erro"] = f"{nome_exc}: {e}"
-            self.log(f"Erro: {resultado['erro']}", level="error")
-            self.log(traceback.format_exc(), level="debug")
-
-        return resultado
-
-    # ------------------------------------------------------------------
-    # Processamento de pagina
-    # ------------------------------------------------------------------
-    def _processar_pagina(self, page, sheet, linha_inicio: int, larguras: dict) -> bool:
-        texto_real = page.extract_text() or ""
-
-        # 1. Estrutura de tabela real (linhas desenhadas) -> estrategia 'lines'
-        if self._tem_estrutura_tabela_real(page):
-            tabelas = self._extrair_tabelas_estrategia(page, "lines")
-            validas = [t for t in tabelas
-                       if t and self._qualidade_tabela_suficiente(t)
-                       and not self._eh_prosa_fragmentada(t)]
-            if validas:
-                linha = linha_inicio
-                for t in validas:
-                    linha = self._escrever_tabela(sheet, t, linha, larguras)
-                    linha += 1  # linha em branco entre tabelas
-                return True
-
-        # 2. Extracao por linhas de palavras (NAO parte palavras ao meio).
-        #    Agrupa palavras proximas na mesma celula e so separa colunas
-        #    onde existe um espaco horizontal grande de verdade.
-        rows = self._extrair_linhas_palavras(page)
-        if rows:
-            self._escrever_tabela(sheet, rows, linha_inicio, larguras)
+def is_saldo_line(rest: str) -> bool:
+    """Verifica se o restante da linha e um tipo SALDO que deve ser ignorado."""
+    upper = rest.upper()
+    for skip in SKIP_TYPES:
+        if skip in upper:
             return True
+    return False
 
-        # 3. Texto livre (ultima alternativa)
-        self._escrever_texto(sheet, texto_real, linha_inicio)
-        return False
 
-    def _extrair_linhas_palavras(self, page):
-        """
-        Extrai o conteudo da pagina como linhas de celulas, agrupando
-        palavras pela posicao vertical e separando colunas apenas quando
-        o espaco horizontal entre palavras e grande.
-        Nunca corta uma palavra ao meio.
-        """
-        try:
-            words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
-        except Exception:
-            return []
-        if not words:
-            return []
+def is_stop_line(line: str) -> bool:
+    """Verifica se a linha e um marcador de parada (fim do extrato)."""
+    upper = line.upper().strip()
+    for marker in STOP_MARKERS:
+        if upper.startswith(marker):
+            return True
+    return False
 
-        # Agrupa palavras em linhas pela coordenada vertical (top)
-        words.sort(key=lambda w: (round(w["top"] / 3), w["x0"]))
-        linhas = []
-        atual = []
-        topo_atual = None
-        for w in words:
-            if topo_atual is None or abs(w["top"] - topo_atual) <= 4:
-                atual.append(w)
-                if topo_atual is None:
-                    topo_atual = w["top"]
+
+def extract_value_cd(rest: str) -> Tuple[str, str, str]:
+    """
+    Tenta extrair valor e C/D do restante da linha.
+
+    Retorna (tipo, valor, cd) onde:
+      - tipo: texto restante apos remover valor e C/D
+      - valor: string do valor numerico (ex: "1.218,20")
+      - cd: "C", "D" ou "" se nao encontrado nesta linha
+    """
+    # Padrao 1: valor com C/D colado (ex: "240,00C" ou "1.440,36D")
+    m = re.search(r'([\d.]+,\d{2})\s*([CD])\s*$', rest)
+    if m:
+        valor = m.group(1)
+        cd = m.group(2)
+        tipo = rest[:m.start()].strip()
+        return tipo, valor, cd
+
+    # Padrao 2: valor sem C/D (C/D na proxima linha)
+    m = re.search(r'([\d.]+,\d{2})\s*$', rest)
+    if m:
+        valor = m.group(1)
+        tipo = rest[:m.start()].strip()
+        return tipo, valor, ""
+
+    # Padrao 3: valor com asterisco (ex: "0,00*")
+    m = re.search(r'([\d.]+,\d{2})\*', rest)
+    if m:
+        valor = m.group(1)
+        tipo = rest[:m.start()].strip()
+        return tipo, valor, ""
+
+    # Nenhum valor encontrado
+    return rest.strip(), "", ""
+
+
+# ---------------------------------------------------------------------------
+# Parser principal
+# ---------------------------------------------------------------------------
+def parse_transactions(pdf_path: str) -> Tuple[List[Dict], Optional[int]]:
+    """
+    Faz o parse de todas as transacoes do PDF.
+
+    Retorna (lista_de_transacoes, ano) onde cada transacao e um dict com:
+      - date: str (DD/MM)
+      - type: str (tipo da transacao)
+      - value: str (valor no formato brasileiro)
+      - cd: str ("C" ou "D")
+      - desc: str (descricao completa)
+    """
+    transactions: List[Dict] = []
+    year: Optional[int] = None
+
+    with pdfplumber.open(pdf_path) as pdf:
+        # Coletar texto de todas as paginas
+        all_text = []
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            if not year:
+                year = extract_year(text)
+            all_text.append(text)
+
+        full_text = "\n".join(all_text)
+        lines = full_text.split("\n")
+
+    if not year:
+        print("AVISO: Nao foi possivel determinar o ano. Usando 2025.", file=sys.stderr)
+        year = 2025
+
+    # Estado do parser
+    i = 0
+    pending_value = ""  # Valor solto que apareceu antes de uma linha DD/MM
+
+    while i < len(lines):
+        line = lines[i].strip()
+
+        # Verificar marcadores de parada
+        if is_stop_line(line):
+            break
+
+        # Verificar se e uma linha com valor solto (antes de SALDO DO DIA)
+        if re.match(r'^[\d.]+,\d{2}\*?$', line) and not is_transaction_start(line):
+            pending_value = line.rstrip('*')
+            i += 1
+            continue
+
+        # Verificar se e inicio de transacao
+        m = re.match(r'^(\d{2}/\d{2})\s+(.*)', line)
+        if not m:
+            # Linha C/D solta
+            if line in ('C', 'D') and transactions:
+                transactions[-1]['cd'] = line
+            i += 1
+            continue
+
+        date_str = m.group(1)
+        rest = m.group(2).strip()
+
+        # Pular linhas de saldo
+        if is_saldo_line(rest):
+            pending_value = ""
+            if i + 1 < len(lines) and lines[i + 1].strip() in ('C', 'D'):
+                i += 2
             else:
-                linhas.append(atual)
-                atual = [w]
-                topo_atual = w["top"]
-        if atual:
-            linhas.append(atual)
+                i += 1
+            continue
 
-        rows = []
-        for linha in linhas:
-            linha.sort(key=lambda w: w["x0"])
-            # largura media de caractere nesta linha (para calibrar o limiar)
-            chars = sum(len(w["text"]) for w in linha)
-            largura_total = sum(max(0, w["x1"] - w["x0"]) for w in linha)
-            char_w = (largura_total / chars) if chars else 4.0
-            limiar = max(10.0, char_w * 4.0)
+        # Extrair tipo, valor e C/D
+        tx_type, value, cd = extract_value_cd(rest)
 
-            celulas = []
-            cel = [linha[0]]
-            for prev, w in zip(linha, linha[1:]):
-                gap = w["x0"] - prev["x1"]
-                if gap >= limiar:  # espaco grande -> nova coluna
-                    celulas.append(" ".join(c["text"] for c in cel))
-                    cel = [w]
-                else:
-                    cel.append(w)
-            celulas.append(" ".join(c["text"] for c in cel))
-            rows.append(celulas)
-        return rows
+        # Se nao encontrou valor na linha, usar valor pendente
+        if not value and pending_value:
+            value = pending_value
+            pending_value = ""
 
+        # Limpar valor pendente se nao foi usado
+        if value:
+            pending_value = ""
 
-    def _tem_estrutura_tabela_real(self, page) -> bool:
-        try:
-            num_linhas = len(page.lines)
-            num_rects = len(page.rects)
-            num_edges = len(page.edges) if hasattr(page, "edges") else 0
-        except Exception:
-            return False
-        return num_linhas >= 4 or num_rects >= 2 or num_edges >= 6
+        # Verificar C/D na proxima linha
+        if not cd and i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            if next_line in ('C', 'D'):
+                cd = next_line
+                i += 1  # Consumir a linha do C/D
 
-    def _indicio_tabela_sem_bordas(self, page, texto_real: str) -> bool:
-        try:
-            words = page.extract_words()
-            if len(words) < 8:
-                return False
-            linhas = defaultdict(list)
-            for w in words:
-                chave = round(w["top"] / 3) * 3
-                linhas[chave].append(w)
-            if len(linhas) < 3:
-                return False
-            x_starts = Counter()
-            for linha_words in linhas.values():
-                for w in linha_words:
-                    x_starts[round(w["x0"] / 5) * 5] += 1
-            colunas_alinhadas = sum(1 for c in x_starts.values() if c >= 3)
-            return colunas_alinhadas >= 2
-        except Exception:
-            return False
+        # Coletar linhas de descricao
+        desc_lines = []
+        i += 1
+        while i < len(lines):
+            next_line = lines[i].strip()
 
-    def _eh_prosa_fragmentada(self, tabela) -> bool:
-        if not tabela:
-            return False
-        muitas = total = 0
-        for linha in tabela:
-            texto = " ".join(str(c).strip() for c in linha if c and str(c).strip())
-            if not texto:
+            # Parar se for inicio de nova transacao
+            if is_transaction_start(next_line):
+                break
+
+            # Parar se for marcador de parada
+            if is_stop_line(next_line):
+                break
+
+            # Parar se for linha de saldo
+            if is_saldo_line(next_line):
+                break
+
+            # Ignorar valores soltos (pertencem a saldo do dia)
+            if re.match(r'^[\d.]+,\d{2}\*?$', next_line):
+                pending_value = next_line.rstrip('*')
+                i += 1
                 continue
-            total += 1
-            if len(texto.split()) > 7:
-                muitas += 1
-        if total == 0:
-            return False
-        return (muitas / total) > 0.5
 
-    def _extrair_tabelas_estrategia(self, page, estrategia: str) -> list:
-        try:
-            tabelas = page.extract_tables(
-                table_settings={
-                    "vertical_strategy": estrategia,
-                    "horizontal_strategy": estrategia,
-                    "snap_tolerance": 3,
-                    "join_tolerance": 3,
-                    "edge_min_length": 3,
-                    "text_tolerance": 1,
-                }
-            )
-        except Exception:
-            tabelas = []
-        return tabelas or []
+            # Ignorar C/D solto se ainda nao temos descricao
+            if next_line in ('C', 'D') and not desc_lines:
+                if not cd:
+                    cd = next_line
+                i += 1
+                continue
 
-    def _parece_tabular(self, tabela) -> bool:
-        if not tabela or len(tabela) < 2:
-            return False
-        col_counts = [len(linha) for linha in tabela]
-        if not col_counts:
-            return False
-        contagem = Counter(col_counts)
-        num_cols_mais_comum, freq = contagem.most_common(1)[0]
-        consistencia = freq / len(tabela)
-        if consistencia < 0.7 or num_cols_mais_comum < 2:
-            return False
-        comprimentos = []
-        for linha in tabela:
-            for celula in linha:
-                if celula and str(celula).strip():
-                    comprimentos.append(len(str(celula).strip()))
-        if not comprimentos:
-            return False
-        return sum(comprimentos) / len(comprimentos) <= 60
+            desc_lines.append(next_line)
+            i += 1
 
-    def _qualidade_tabela_suficiente(self, tabela) -> bool:
-        if not tabela or len(tabela) < self.MIN_TABLE_ROWS:
-            return False
-        max_cols = max((len(linha) for linha in tabela), default=0)
-        if max_cols < self.MIN_TABLE_COLS:
-            return False
-        return any(any(c and str(c).strip() for c in linha) for linha in tabela)
+        description = ' '.join(desc_lines).strip()
 
-    # ------------------------------------------------------------------
-    # Escrita
-    # ------------------------------------------------------------------
-    def _escrever_tabela(self, sheet, tabela, linha_inicio: int, larguras: dict) -> int:
-        tabela = self._dividir_valor_direcao(tabela)
-        linha = linha_inicio
-        for i, row in enumerate(tabela):
-            for j, celula in enumerate(row, start=1):
-                valor = self._limpar_celula(celula)
-                c = sheet.cell(row=linha, column=j, value=valor)
-                c.font = TEXT_FONT
-                c.alignment = WRAP_ALIGNMENT
-                if i == 0 and linha_inicio == 1:
-                    c.font = HEADER_FONT
-                    c.fill = HEADER_FILL
-            linha += 1
-        self._atualizar_larguras(tabela, larguras)
-        return linha
+        # Montar transacao
+        transactions.append({
+            'date': date_str,
+            'type': tx_type,
+            'value': value,
+            'cd': cd,
+            'desc': description,
+        })
 
-    def _escrever_texto(self, sheet, texto: str, linha_inicio: int) -> int:
-        if not texto.strip():
-            c = sheet.cell(row=linha_inicio, column=1, value="[Página sem texto extraído]")
-            c.font = Font(italic=True, color="999999")
-            return linha_inicio + 1
-        linhas = texto.split("\n")
-        for i, linha in enumerate(linhas):
-            c = sheet.cell(row=linha_inicio + i, column=1, value=linha)
-            c.font = TEXT_FONT
-            c.alignment = WRAP_ALIGNMENT
-        return linha_inicio + len(linhas)
+    return transactions, year
 
-    # ------------------------------------------------------------------
-    # Utilitarios
-    # ------------------------------------------------------------------
-    def _dividir_valor_direcao(self, tabela):
-        """Separa celulas do tipo '72,12D' em duas: '72,12' e 'D'."""
-        nova = []
-        for linha in tabela:
-            nova_linha = []
-            for celula in linha:
-                txt = self._limpar_celula(celula)
-                m = _VALOR_DIR_RE.match(txt)
-                if m:
-                    nova_linha.append(m.group(1))
-                    nova_linha.append(m.group(2).upper())
-                else:
-                    nova_linha.append(celula)
-            nova.append(nova_linha)
-        return nova
 
-    @staticmethod
-    def _limpar_celula(valor) -> str:
-        if valor is None:
-            return ""
-        texto = str(valor).strip()
-        texto = texto.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
-        while "  " in texto:
-            texto = texto.replace("  ", " ")
-        return texto
+# ---------------------------------------------------------------------------
+# Geracao do CSV
+# ---------------------------------------------------------------------------
+def generate_csv(
+    transactions: List[Dict],
+    year: int,
+    output_path: str,
+) -> None:
+    """
+    Gera o arquivo CSV com as transacoes extraidas.
 
-    @staticmethod
-    def _atualizar_larguras(tabela, larguras: dict) -> None:
-        if not tabela:
-            return
-        num_cols = max((len(linha) for linha in tabela), default=0)
-        for col_idx in range(1, num_cols + 1):
-            max_len = 10
-            for linha in tabela:
-                if col_idx <= len(linha):
-                    celula = linha[col_idx - 1]
-                    if celula:
-                        for sub in str(celula).split("\n"):
-                            max_len = max(max_len, len(sub))
-            larguras[col_idx] = max(larguras.get(col_idx, 0), max_len)
+    Formato: DATA,TIPO,"VALOR",C/D,DESCRICAO
+    """
+    with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
+        # Cabecalho
+        writer.writerow(['DATA', 'TIPO', 'VALOR', 'C/D', 'DESCRICAO'])
+
+        for tx in transactions:
+            date_full = f"{tx['date']}/{year}"
+            writer.writerow([
+                date_full,
+                tx['type'],
+                tx['value'],
+                tx['cd'],
+                tx['desc'],
+            ])
+
+
+# ---------------------------------------------------------------------------
+# Ponto de entrada
+# ---------------------------------------------------------------------------
+def main():
+    if len(sys.argv) < 2:
+        print("Uso: python extract_sicoob_csv.py <arquivo.pdf> [saida.csv]")
+        print("Exemplo: python extract_sicoob_csv.py extrato.pdf saida.csv")
+        sys.exit(1)
+
+    pdf_path = sys.argv[1]
+
+    if not os.path.isfile(pdf_path):
+        print(f"ERRO: Arquivo nao encontrado: {pdf_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # Determinar caminho de saida
+    if len(sys.argv) >= 3:
+        csv_path = sys.argv[2]
+    else:
+        base = os.path.splitext(pdf_path)[0]
+        csv_path = base + '.csv'
+
+    print(f"Processando: {pdf_path}")
+    print("-" * 50)
+
+    # Extrair transacoes
+    transactions, year = parse_transactions(pdf_path)
+
+    if not transactions:
+        print("AVISO: Nenhuma transacao encontrada no PDF.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Ano detectado: {year}")
+    print(f"Transacoes encontradas: {len(transactions)}")
+    print()
+
+    # Mostrar primeiras transacoes como preview
+    print("Preview (primeiras 10 transacoes):")
+    print(f"{'DATA':<12} {'TIPO':<25} {'VALOR':>12} {'C/D':<4} {'DESCRICAO'}")
+    print("-" * 100)
+    for tx in transactions[:10]:
+        date_full = f"{tx['date']}/{year}"
+        desc_preview = (tx['desc'][:40] + '...') if len(tx['desc']) > 40 else tx['desc']
+        print(f"{date_full:<12} {tx['type']:<25} {tx['value']:>12} {tx['cd']:<4} {desc_preview}")
+    if len(transactions) > 10:
+        print(f"... e mais {len(transactions) - 10} transacoes")
+    print()
+
+    # Gerar CSV
+    generate_csv(transactions, year, csv_path)
+    print(f"CSV salvo em: {csv_path}")
+
+    # Estatisticas
+    credit_count = sum(1 for tx in transactions if tx['cd'] == 'C')
+    debit_count = sum(1 for tx in transactions if tx['cd'] == 'D')
+    print(f"  Creditos: {credit_count}")
+    print(f"  Debitos: {debit_count}")
+
+
+if __name__ == '__main__':
+    main()
